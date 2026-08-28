@@ -1,0 +1,201 @@
+"""
+FOMO AI Platform - Simple Meme Coin Filter
+Backend + API
+"""
+
+from flask import Flask, render_template, jsonify
+import requests
+import time
+import json
+import os
+from datetime import datetime
+from pathlib import Path
+
+app = Flask(__name__)
+
+# ====================== CONFIG ======================
+XAI_API_KEY = os.getenv("XAI_API_KEY", "PUT_YOUR_GROK_KEY_HERE")
+DATA_FILE = Path(__file__).parent / "data" / "latest_results.json"
+
+# ====================== AI PROMPTS ======================
+SCANNER = """
+You are a Solana meme coin scanner.
+Input: list of new/trending Solana tokens with liquidity, volume, change, age.
+Output ONLY the top 5 most interesting ones. One short line each.
+Format: SYMBOL | Why it stands out
+If nothing good: NOTHING INTERESTING
+"""
+
+HEAD = """
+You are Head of Desk recommending meme coins for FOMO traders.
+From the scanner results, pick the best 3-5 coins.
+For each write:
+- Symbol and short name
+- One sentence why it is interesting now
+- Main risk in few words
+Keep total under 120 words. Be direct.
+If nothing good: QUIET DAY
+"""
+
+# ====================== DATA FETCH ======================
+
+def fetch_solana_pairs():
+    """Fetch real pairs from DexScreener (Solana)"""
+    try:
+        url = "https://api.dexscreener.com/latest/dex/pairs/solana"
+        r = requests.get(url, timeout=15)
+        if r.status_code != 200:
+            r = requests.get("https://api.dexscreener.com/latest/dex/search?q=SOL", timeout=12)
+        
+        data = r.json()
+        pairs = data.get("pairs") or []
+        
+        results = []
+        for p in pairs[:50]:
+            try:
+                liq = float(p.get("liquidity", {}).get("usd", 0) or 0)
+                vol = float(p.get("volume", {}).get("h24", 0) or 0)
+                change = float(p.get("priceChange", {}).get("h24", 0) or 0)
+                
+                if liq < 5000 or vol < 8000:
+                    continue
+                
+                base = p.get("baseToken", {})
+                symbol = base.get("symbol", "???")
+                name = base.get("name", "Unknown")
+                address = base.get("address", "")
+                price = p.get("priceUsd", "0")
+                
+                age_h = None
+                created = p.get("pairCreatedAt")
+                if created:
+                    age_h = (time.time() * 1000 - created) / (1000 * 3600)
+                
+                if age_h and age_h > 96:
+                    continue
+                
+                results.append({
+                    "symbol": symbol,
+                    "name": name,
+                    "address": address,
+                    "price": price,
+                    "liquidity": round(liq),
+                    "volume_24h": round(vol),
+                    "change_24h": round(change, 1),
+                    "age_hours": round(age_h, 1) if age_h else None,
+                    "url": p.get("url", f"https://dexscreener.com/solana/{address}")
+                })
+            except Exception:
+                continue
+        
+        results = sorted(results, key=lambda x: x["volume_24h"], reverse=True)
+        return results[:20]
+    
+    except Exception as e:
+        print("Fetch error:", e)
+        return []
+
+
+def call_grok(system, user_text):
+    if not XAI_API_KEY or XAI_API_KEY.startswith("PUT_"):
+        return "AI key not set – showing filtered data only."
+    
+    try:
+        r = requests.post(
+            "https://api.x.ai/v1/chat/completions",
+            headers={"Authorization": f"Bearer {XAI_API_KEY}"},
+            json={
+                "model": "grok-4-fast",
+                "messages": [
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": user_text}
+                ],
+                "temperature": 0.3
+            },
+            timeout=35
+        )
+        r.raise_for_status()
+        return r.json()["choices"][0]["message"]["content"].strip()
+    except Exception as e:
+        return f"AI error: {e}"
+
+
+def run_analysis():
+    tokens = fetch_solana_pairs()
+    
+    if not tokens:
+        result = {
+            "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M"),
+            "status": "no_data",
+            "message": "Could not fetch data right now. Try again later.",
+            "tokens": [],
+            "ai_summary": "No data"
+        }
+        save_results(result)
+        return result
+    
+    lines = []
+    for t in tokens[:15]:
+        age = f"{t['age_hours']}h" if t["age_hours"] else "N/A"
+        lines.append(
+            f"{t['symbol']} ({t['name']}) | "
+            f"Liq ${t['liquidity']:,} | Vol ${t['volume_24h']:,} | "
+            f"Change {t['change_24h']:+}% | Age {age}"
+        )
+    text_block = "\n".join(lines)
+    
+    scan = call_grok(SCANNER, text_block)
+    summary = call_grok(HEAD, scan + "\n\n" + text_block)
+    
+    result = {
+        "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M"),
+        "status": "ok",
+        "tokens": tokens[:12],
+        "ai_scan": scan,
+        "ai_summary": summary
+    }
+    save_results(result)
+    return result
+
+
+def save_results(data):
+    DATA_FILE.parent.mkdir(exist_ok=True)
+    with open(DATA_FILE, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
+
+def load_results():
+    if DATA_FILE.exists():
+        with open(DATA_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    return {
+        "updated_at": "-",
+        "status": "empty",
+        "tokens": [],
+        "ai_summary": "No scan yet. Press Refresh."
+    }
+
+
+@app.route("/")
+def index():
+    return render_template("index.html")
+
+
+@app.route("/api/results")
+def api_results():
+    return jsonify(load_results())
+
+
+@app.route("/api/refresh")
+def api_refresh():
+    result = run_analysis()
+    return jsonify(result)
+
+
+if __name__ == "__main__":
+    if not DATA_FILE.exists():
+        print("Running first analysis...")
+        run_analysis()
+    
+    print("Platform running at http://0.0.0.0:5000")
+    app.run(host="0.0.0.0", port=5000, debug=False)
